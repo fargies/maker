@@ -4,3 +4,6 @@ set(maker_SRCS
 add_executable(maker ${maker_SRCS})
 target_link_libraries(maker rt)
 
+install(TARGETS maker
+    RUNTIME DESTINATION bin)
+
