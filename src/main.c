@@ -35,10 +35,83 @@
 #include <semaphore.h>
 #include <poll.h>
 
-#define LOG_FILE "./.maker.log"
+#define MAKER_CMD "MAKER_CMD"
+#define LOG_FILE ".maker.log"
+#define DEFAULT_CMD "/usr/bin/make"
+#define SEM_NAME "/maker"
+
 #define BUFFER_SIZE 2048
 
 extern char **environ;
+
+#define mk_error(fmt, args...) \
+    fprintf(stderr, "[maker]: " fmt "\n", ##args)
+
+#define mk_info(fmt, args...) \
+    fprintf(stderr, "[maker]: " fmt "\n", ##args)
+
+static int launch_cmd(int argc, char *argv[], int log)
+{
+    sem_t *sem = sem_open(SEM_NAME, O_CREAT, 0644, 0);
+    if (sem == SEM_FAILED)
+    {
+        mk_error("Sem open failed: %s", strerror(errno));
+        return 1;
+    }
+
+    pid_t pid = fork();
+    if (!pid)
+    {
+        mk_info("Launching command");
+        close(log);
+
+        if (daemon(1, 0) != 0)
+        {
+            mk_error("Daemon failed: %s", strerror(errno));
+            exit(1);
+        }
+
+        log = open(LOG_FILE, O_WRONLY);
+        dup2(log, 1);
+        dup2(log, 2);
+        close(log);
+
+        struct flock f;
+        memset(&f, 0, sizeof (struct flock));
+        f.l_whence = SEEK_SET;
+        f.l_type = F_WRLCK;
+
+        fcntl(1, F_SETLKW, &f);
+
+        sem_post(sem);
+        sem_close(sem);
+
+        char *cmd = getenv(MAKER_CMD);
+        if (cmd)
+            argv[0] = cmd;
+        else
+            argv[0] = DEFAULT_CMD;
+        execve(argv[0], argv, environ);
+        mk_error("Failed to launch command (%s): %s",
+                argv[0], strerror(errno));
+        exit(1);
+    }
+    else
+    {
+        struct flock f;
+        memset(&f, 0, sizeof (struct flock));
+        f.l_whence = SEEK_SET;
+        f.l_type = F_UNLCK;
+        fcntl(log, F_SETLK, &f);
+        sem_wait(sem);
+        sem_close(sem);
+        sem_unlink(SEM_NAME);
+
+        int status;
+        waitpid(pid, &status, 0);
+    }
+    return 0;
+}
 
 int main(int argc, char *argv[])
 {
@@ -47,7 +120,7 @@ int main(int argc, char *argv[])
     int log = open(LOG_FILE, O_RDONLY | O_CREAT | O_NONBLOCK, 0644);
     if (log < 0 || (fstat(log, &st) != 0))
     {
-        perror("Failed to open log");
+        mk_error("Failed to open log: %s", strerror(errno));
         return 1;
     }
 
@@ -58,48 +131,10 @@ int main(int argc, char *argv[])
 
     if ((st.st_size == 0) && (fcntl(log, F_SETLK, &f) == 0))
     {
-        sem_t *sem = sem_open("/maker", O_CREAT, 0644, 0);
-        if (sem == SEM_FAILED)
+        if (launch_cmd(argc, argv, log) != 0)
         {
-            perror("Sem open failed");
+            mk_error("Failed to launch command");
             return 1;
-        }
-
-        pid_t pid = fork();
-        if (!pid)
-        {
-            fprintf(stderr, "Launching make command");
-            close(log);
-
-            if (daemon(1, 0) != 0)
-            {
-                perror("Daemon failed");
-            }
-            log = open(LOG_FILE, O_WRONLY);
-            dup2(log, 1);
-            dup2(log, 2);
-            close(log);
-
-            f.l_type = F_WRLCK;
-            fcntl(1, F_SETLKW, &f);
-
-            sem_post(sem);
-            sem_close(sem);
-
-            argv[0] = "/usr/bin/make";
-            execve("/usr/bin/make", argv, environ);
-        }
-        else
-        {
-            f.l_whence = SEEK_SET;
-            f.l_type = F_UNLCK;
-            fcntl(log, F_SETLK, &f);
-            sem_wait(sem);
-            sem_close(sem);
-            sem_unlink("/maker");
-
-            int status;
-            waitpid(pid, &status, 0);
         }
     }
 
@@ -110,7 +145,7 @@ int main(int argc, char *argv[])
     pfd.events = POLLIN;
 
     f.l_type = F_RDLCK;
-    while (poll(&pfd, 1, -1) > 0)
+    while (poll(&pfd, 1, 1000) >= 0)
     {
         char unlocked = 0;
         ssize_t readed;
