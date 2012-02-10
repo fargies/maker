@@ -26,6 +26,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -113,6 +114,49 @@ static int launch_cmd(int argc, char *argv[], int log)
     return 0;
 }
 
+int file_watch_init()
+{
+    int ino = inotify_init();
+
+    if (ino < 0)
+    {
+        mk_error("Failed to initialize inotify: %s", strerror(errno));
+        return ino;
+    }
+    else if (inotify_add_watch(ino, LOG_FILE, IN_MODIFY | IN_CLOSE_WRITE) < 0)
+    {
+        mk_error("Failed to add watch: %s", strerror(errno));
+        close(ino);
+        return -1;
+    }
+    return ino;
+}
+
+void file_watch_close(int ino)
+{
+    close(ino);
+}
+
+int file_wait_event(int ino, char *buffer, char *write_closed)
+{
+    struct inotify_event *evt = (struct inotify_event *) buffer;
+    int ret = read(ino, buffer, BUFFER_SIZE);
+
+    if (ret < 0)
+    {
+        mk_error("Wait aborted: %s", strerror(errno));
+        return 1;
+    }
+
+    while (ret > sizeof(struct inotify_event))
+    {
+        if (evt->mask & IN_CLOSE_WRITE && write_closed != NULL)
+            *write_closed = 1;
+        ret -= sizeof(struct inotify_event) + evt->len;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     struct stat st;
@@ -139,31 +183,38 @@ int main(int argc, char *argv[])
     }
 
     char *buffer = malloc(BUFFER_SIZE);
+    int ino = file_watch_init(LOG_FILE);
 
-    struct pollfd pfd;
-    pfd.fd = log;
-    pfd.events = POLLIN;
+    if (ino < 0)
+        return 1;
 
     f.l_type = F_RDLCK;
-    while (poll(&pfd, 1, 1000) >= 0)
+    char write_closed = 0;
+    do
     {
-        char unlocked = 0;
         ssize_t readed;
 
         if (fcntl(log, F_SETLK, &f) == 0)
-            unlocked = 1;
+            write_closed = 1;
 
         while ((readed = read(log, buffer, BUFFER_SIZE)) > 0)
-            write(1, buffer, readed);
-
-        if (unlocked != 0)
         {
+            write(1, buffer, readed);
+            if (readed < BUFFER_SIZE)
+                break;
+        }
+
+        if (write_closed != 0)
+        {
+            mk_info("Command finished");
             close(log);
             unlink(LOG_FILE);
             break;
         }
     }
+    while (file_wait_event(ino, buffer, &write_closed) == 0);
 
+    file_watch_close(ino);
     free(buffer);
     return 0;
 }
